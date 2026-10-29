@@ -74,8 +74,7 @@ monthly_pivot = df %>%
   ungroup()
 
 ggplot(monthly_pivot, 
-       aes(day_name, bed_holds, colour = month_name, group = month_name)) 
-+ geom_line() + geom_point()
+       aes(day_name, bed_holds, colour = month_name, group = month_name)) + geom_line() + geom_point()
 
 
 #############################################################################

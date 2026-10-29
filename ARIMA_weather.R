@@ -343,3 +343,293 @@ m_eval[,"RMSE"] =
     sqrt(mean((pred_results$Pred_m2 - pred_results$Total_Patients)^2)))
 
 m_eval
+
+
+
+
+
+######################################################################################
+######################################################################################
+############ Predict daily census until 2027-05-01 ###############
+last_date <- cno$date[nrow(cno)]
+end_date  <- as.Date("2027-05-01")
+
+future_dates <- seq(
+  from = last_date + 1,
+  to = end_date - 1,
+  by = "day"
+)
+
+h <- length(future_dates)
+h
+
+#Future holidays
+holidays_future = get_holiday_df(start_day = last_date, 
+                                 end_day = end_date, holidays_unique)
+
+# *Observed* future holidays
+holidays_future =  holidays_future[!holidays_future$dow_name %in% 
+                                     c("Saturday", "Sunday"), ]
+#Future design matrix
+future <- data.frame(date = future_dates) %>%
+  mutate(
+    day_name = factor(
+      weekdays(date),
+      levels = c(
+        "Sunday", "Monday", "Tuesday",
+        "Wednesday", "Thursday",
+        "Friday", "Saturday"
+      )
+    ),
+    
+    is_federal_holiday = as.integer(date %in% holidays_future$date),
+    
+    holiday_lag1 = as.integer(
+      (date - 1) %in% holidays_future$date
+    ),
+    
+    holiday_lead1 = as.integer(
+      (date + 1) %in% holidays_future$date
+    )
+  )
+
+#Note that future days to be predicted don't include June or July, which are 
+#predictors in the model
+xreg_future <- model.matrix(
+  ~ day_name +
+    is_federal_holiday +
+    holiday_lag1 +
+    holiday_lead1,
+  data = future
+)[, -1, drop = FALSE]
+colnames(xreg_future)[1:6] = c("Monday", "Tuesday", "Wednesday",
+                               "Thursday", "Friday", "Saturday"
+)
+xreg_future = as.data.frame(xreg_future)
+xreg_future$Month6 = 0
+xreg_future$Month7 = 0
+xreg_future = xreg_future[, c(1:6, 10:11, 7:9)]
+colSums(is.na(xreg_future))
+xreg_future = data.frame(Year2024 = 0, Year2025 = 0, Year2026 = 1,
+                            xreg_future)
+
+#Combine df and CNO daily census
+df = df %>%
+  full_join(cno %>%
+              select(date, day_name, total_census) %>%
+              rename(total_census_cno = total_census),
+            by = c("date", "day_name"))
+df$year = year(df$date)
+df$month_name = month(df$date)
+df$month_name = factor(df$month_name, labels = month.name)
+
+
+#Check census data
+id = which(!is.na(df$total_census) & df$date >= as.Date("2026-01-01")
+           & df$date <= as.Date("2026-08-18"))
+table(df$total_census[id] == df$total_census_cno[id], useNA = "ifany") #all TRUE except missing total_census_cno
+remove(id)
+
+#Append total_census after 2026-08-18 using CNO data
+id = which(df$date > as.Date("2026-08-18"))
+df$total_census[id] = df$total_census_cno[id]
+df = df %>% select(!total_census_cno)
+remove(id)
+
+#Observed federal holiday for training data
+holidays_df = get_holiday_df(start_day = df$date[1], 
+                                 end_day = df$date[nrow(df)], holidays_unique)
+
+# *Observed* future holidays
+holidays_df =  holidays_df[!holidays_df$dow_name %in% 
+                                     c("Saturday", "Sunday"), ]
+df$is_federal_holiday_observed = as.integer(df$date %in% holidays_df$date)
+
+#Training data design matrix (train from 2023)
+xreg_all = model.matrix(~ factor(year) + day_name
+                        + month_name, df)[, -1, drop = FALSE]
+colnames(xreg_all)[1:11] = c("Year2022", "Year2023",
+                            "Year2024", "Year2025", "Year2026",
+                            "Monday", "Tuesday", "Wednesday",
+                            "Thursday", "Friday", "Saturday"
+)
+colnames(xreg_all)[12:22] = paste0("Month", 2:12)
+xreg_all = cbind(xreg_all, df[, "is_federal_holiday_observed"])
+colnames(xreg_all)[23] = "is_federal_holiday"
+xreg_all$holiday_lag1 = lag(xreg_all$is_federal_holiday, 1)
+xreg_all$holiday_lag1[1] = 0
+xreg_all$holiday_lead1 = lead(xreg_all$is_federal_holiday, 1)
+xreg_all$holiday_lead1[nrow(xreg_all)] = 0
+
+vars = c("Year2022", "Year2023", paste0("Month", 2:5), paste0("Month", 8:12))
+vars_id = which(names(xreg_all) %in% vars)
+xreg_all = xreg_all[, -vars_id]
+colSums(is.na(xreg_all))
+
+#Train model
+train_idx = which(df$date >= as.Date("2023-01-01"))
+fit0_census <- arima(
+  df$total_census[train_idx],
+  order = c(1, 0, 1),
+  xreg = xreg_all[train_idx, -9], #Combine Saturday and Sunday
+  include.mean = TRUE,
+  method = "ML"
+)
+summary(fit0_census)
+
+fc_census <- predict(
+  fit0_census,
+  n.ahead = h,
+  newxreg = xreg_future[, -9]
+)
+
+# Forecast through April 30, 2027
+forecast_results_census <- data.frame(
+  date = future_dates,
+  predicted_ed_census = as.numeric(fc_census$pred),
+  lower95 = as.numeric(fc_census$pred - 1.96 * fc_census$se),
+  upper95 = as.numeric(fc_census$pred + 1.96 * fc_census$se)
+)
+
+#Plot
+ggplot(forecast_results_census,
+       aes(x = date, y = predicted_ed_census)) +
+  geom_ribbon(
+    aes(ymin = lower95, ymax = upper95),
+    alpha = 0.2
+  ) +
+  geom_line(color = "blue", linewidth = 0.7) +
+  labs(
+    title = "ED Census Forecast",
+    subtitle = "October 6, 2026 – April 30, 2027",
+    x = "Date",
+    y = "Predicted ED Census"
+  ) +
+  theme_minimal()
+
+write.csv(forecast_results_census, file = "Forecast_ed_census_wz.csv", row.names = F)
+
+pred_results = data.frame(
+  date = df_test$date,
+  total_census = df_test$total_census,
+  pred_m1 = NA,
+  pred_m2 = NA
+)
+for(i in 1:nrow(df_test)){
+  
+  #Forecast date
+  fc_date = df_test$date[i]
+  new_idx <- which(df$date == fc_date)
+  #print(paste("Forcast date:", fc_date))
+  
+  #Expanding training window
+  train_idx <- which(
+    df$date >= train_start &
+      df$date <= (fc_date - 1)
+  )
+  
+  
+  # ARMA(1,1) + year + day-of-week + M6 + M7 + holiday
+  m1 <- arima(
+    df$total_census[train_idx],
+    order = c(1, 0, 1),
+    xreg = xreg_all[train_idx, -9],
+    include.mean = TRUE,
+    method = "ML"
+  )
+  pred_m1 = predict(m1, n.ahead = 1, 
+                    newxreg = xreg_all[new_idx, -9, drop = FALSE])
+  pred_results[i, "pred_m1"] = pred_m1$pred
+  
+  # ARMA(1,1) + year + day-of-week + holiday + holiday_lead1
+  m2 <- arima(
+    df$total_census[train_idx],
+    order = c(1, 0, 1),
+    xreg = xreg_all[train_idx, -c(9, 12)],
+    include.mean = TRUE,
+    method = "ML"
+  )
+  pred_m2 = predict(m2, n.ahead = 1,
+                    newxreg = xreg_all[new_idx, -c(9, 12), drop = FALSE])
+  pred_results[i, "pred_m2"] = pred_m2$pred
+  
+}
+c(m1$aic, m2$aic)
+summary(m1); summary(m2)
+#MAE
+sapply(3:4, function(j) mean(abs(pred_results[, j] - pred_results[, 2]), na.rm = T))
+#RMSE
+sapply(3:4, function(j) sqrt(mean((pred_results[, j] - pred_results[, 2])^2, na.rm = T)))
+
+#Plot
+library(dplyr)
+library(ggplot2)
+
+# 1. Calculate forecast errors
+pred_results <- pred_results %>%
+  mutate(error = pred_m1 - total_census)
+
+# 2. Calculate summary statistics
+mean_error <- mean(pred_results$error, na.rm = TRUE)
+sd_error   <- sd(pred_results$error, na.rm = TRUE)
+
+Q1 <- quantile(pred_results$error, 0.25, na.rm = TRUE)
+Q3 <- quantile(predict_results$error, 0.75, na.rm = TRUE)
+IQR_error <- Q3 - Q1
+
+# Mean +/- SD
+lower_sd <- mean_error - sd_error
+upper_sd <- mean_error + sd_error
+
+# Tukey lower and upper fences
+lower_fence <- Q1 - 1.5 * IQR_error
+upper_fence <- Q3 + 1.5 * IQR_error
+
+# 3. Plot
+ggplot(pred_results, aes(x = date, y = error)) +
+  
+  # Daily forecast errors
+  geom_line(color = "black", linewidth = 0.8) +
+  
+  # Zero reference line
+  geom_hline(
+    yintercept = 0,
+    color = "gray50",
+    linewidth = 0.6
+  ) +
+  
+  # Mean error
+  geom_hline(
+    yintercept = mean_error,
+    color = "blue",
+    linewidth = 1
+  ) +
+  
+  # Mean +/- SD
+  geom_hline(
+    yintercept = c(lower_sd, upper_sd),
+    color = "red",
+    linetype = "dashed",
+    linewidth = 0.8
+  ) +
+  
+  # Lower and upper fences
+  geom_hline(
+    yintercept = c(lower_fence, upper_fence),
+    color = "darkgreen",
+    linetype = "dotted",
+    linewidth = 0.9
+  ) +
+  
+  labs(
+    title = "Daily ED Census Forecast Errors",
+    subtitle = paste0(
+      "Mean = ", round(mean_error, 2),
+      " | SD = ", round(sd_error, 2),
+      " | IQR = ", round(IQR_error, 2)
+    ),
+    x = "Date",
+    y = "Predicted - Actual"
+  ) +
+  
+  theme_minimal(base_size = 13)
